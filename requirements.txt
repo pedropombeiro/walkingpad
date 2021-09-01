@@ -1,5 +1,5 @@
+aiohttp
 asyncio
-pyyaml
-psycopg2-binary
 ph4_walkingpad
-Flask[async]
+psycopg2-binary
+pyyaml
