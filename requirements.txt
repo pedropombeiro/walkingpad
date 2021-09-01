@@ -1,5 +1,6 @@
 aiohttp
 asyncio
 ph4_walkingpad
+prometheus_client
 psycopg2-binary
 pyyaml

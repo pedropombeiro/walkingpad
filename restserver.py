@@ -3,6 +3,7 @@ from bleak.exc import BleakError
 from ph4_walkingpad import pad
 from ph4_walkingpad.pad import WalkingPad, Controller
 from ph4_walkingpad.utils import setup_logging
+from prometheus_client import start_http_server, Gauge, Enum
 import asyncio
 import yaml
 import psycopg2
@@ -24,6 +25,12 @@ last_status = {
     "distance": None,
     "time": None
 }
+
+prom_steps = Gauge('walkingpad_steps', 'WalkingPad session step count')
+prom_distance = Gauge('walkingpad_dist', 'WalkingPad distance')
+prom_speed = Gauge('walkingpad_speed', 'WalkingPad speed')
+prom_state = Enum('walkingpad_state', 'WalkingPad state', states=['idle', 'standby', 'starting', 'running'])
+prom_mode = Enum('walkingpad_mode', 'WalkingPad mode', states=['manual', 'auto', 'standby'])
 
 def on_new_status(sender, record):
 
@@ -82,11 +89,13 @@ async def ensureConnected(attempt=0):
 
     print("- Attempt #{0}".format(attempt+1))
     if connectTask is None:
+        print("- connectTask was None")
         connectTask = connect()
 
     try:
         await connectTask
         connectTask = done()
+        print("- Setting connectTask to done()")
     except BleakError as e:
         if attempt < 1:
             await ctler.disconnect()
@@ -191,7 +200,7 @@ async def change_speed(request):
     try:
         await ctler.change_speed(int(float(value) * 10))
 
-        await asyncio.sleep(ctler.minimal_cmd_space)
+        await asyncio.sleep(minimal_cmd_space)
         await ctler.ask_stats()
         await asyncio.sleep(minimal_cmd_space)
         stats = ctler.last_status
@@ -222,7 +231,7 @@ async def change_pref(request):
         await ctler.disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
 
-    await asyncio.sleep(ctler.minimal_cmd_space)
+    await asyncio.sleep(minimal_cmd_space)
 
 @routes.get("/status")
 async def get_status(request):
@@ -230,6 +239,7 @@ async def get_status(request):
         await ensureConnected()
 
         await ctler.ask_stats()
+        await asyncio.sleep(minimal_cmd_space)
     except BleakError as e:
         await ctler.disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
@@ -257,8 +267,15 @@ async def get_status(request):
     dist = stats.dist / 100
     time = stats.time
     steps = stats.steps
+    speed = stats.app_speed / 30
 
-    return web.json_response({ "dist": dist, "time": time, "steps": steps, "speed": stats.app_speed / 30, "belt_state": belt_state, "mode": mode })
+    prom_steps.set(steps)
+    prom_distance.set(dist)
+    prom_speed.set(speed)
+    prom_state.state(belt_state)
+    prom_mode.state(mode)
+
+    return web.json_response({ "dist": dist, "time": time, "steps": steps, "speed": speed, "belt_state": belt_state, "mode": mode })
 
 
 @routes.get("/history")
@@ -303,7 +320,7 @@ async def finish_walk(request):
         await ensureConnected()
 
         await ctler.stop_belt()
-        await asyncio.sleep(ctler.minimal_cmd_space)
+        await asyncio.sleep(minimal_cmd_space)
         await ctler.switch_mode(WalkingPad.MODE_STANDBY)
         await asyncio.sleep(minimal_cmd_space)
         await ctler.ask_hist(0)
@@ -330,4 +347,5 @@ async def app_factory():
     return app
 
 if __name__ == '__main__':
+    start_http_server(8000) # Start Prometheus server
     web.run_app(app_factory(), port=5678)
