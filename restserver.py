@@ -5,12 +5,16 @@ from ph4_walkingpad.pad import WalkingPad, Controller
 from ph4_walkingpad.utils import setup_logging
 from prometheus_client import start_http_server, Gauge, Enum
 import asyncio
+import time
 import yaml
 import psycopg2
-from datetime import date
+from datetime import date, datetime
 
 routes = web.RouteTableDef()
 connectTask = None
+last_comm_ts = 0
+last_json_status_ts = 0
+last_json_status = {}
 
 # minimal_cmd_space does not exist in the version we use from pip, thus we define it here.
 # This should be removed once we can take it from the controller
@@ -44,6 +48,50 @@ def on_new_status(sender, record):
     last_status['distance'] = distance_in_km
     last_status['time'] = record.time
 
+    json_status = get_status_json(record)
+    update_prom_status(json_status)
+
+def on_new_current_status(sender, record):
+
+    json_status = get_status_json(record)
+    print("{0} - Received Current Record: {1}".format(datetime.now(), json_status))
+
+    update_prom_status(json_status)
+
+def update_prom_status(json_status):
+    prom_steps.set(json_status["steps"])
+    prom_distance.set(json_status["dist"])
+    prom_speed.set(json_status["speed"])
+    prom_state.state(json_status["belt_state"])
+    prom_mode.state(json_status["mode"])
+
+def get_status_json(status):
+    mode = status.manual_mode
+    belt_state = status.belt_state
+
+    if (mode == WalkingPad.MODE_STANDBY):
+        mode = "standby"
+    elif (mode == WalkingPad.MODE_MANUAL):
+        mode = "manual"
+    elif (mode == WalkingPad.MODE_AUTOMAT):
+        mode = "auto"
+
+    if (belt_state == 5):
+        belt_state = "standby"
+    elif (belt_state == 0):
+        belt_state = "idle"
+    elif (belt_state == 1):
+        belt_state = "running"
+    elif (belt_state >=7):
+        belt_state = "starting"
+
+    dist = status.dist / 100
+    time = status.time
+    steps = status.steps
+    speed = status.app_speed / 30
+
+    return { "dist": dist, "time": time, "steps": steps, "speed": speed, "belt_state": belt_state, "mode": mode }
+
 
 def store_in_db(steps, distance_in_km, duration_in_seconds):
     db_config = load_config()['database']
@@ -72,7 +120,7 @@ def load_config():
         try:
             return yaml.safe_load(stream)
         except yaml.YAMLError as exc:
-            print(exc)
+            log.warn(exc)
 
 
 def save_config(config):
@@ -86,16 +134,21 @@ async def done():
 
 async def ensureConnected(attempt=0):
     global connectTask
+    global last_comm_ts
 
-    print("- Attempt #{0}".format(attempt+1))
+    if last_comm_ts != 0 and (time.time() - last_comm_ts) > 60:
+        await disconnect()
+
+    log.debug("- Attempt #{0}".format(attempt+1))
     if connectTask is None:
-        print("- connectTask was None")
+        log.debug("- connectTask was None")
         connectTask = connect()
 
     try:
         await connectTask
         connectTask = done()
-        print("- Setting connectTask to done()")
+        last_comm_ts = time.time()
+        log.debug("- Setting connectTask to done()")
     except BleakError as e:
         if attempt < 1:
             await ctler.disconnect()
@@ -103,24 +156,26 @@ async def ensureConnected(attempt=0):
             connectTask = connect()
             await ensureConnected(attempt+1)
         else:
-            print("Giving up retrying. Raising '{0}'".format(e))
+            log.debug("Giving up retrying. Raising '{0}'".format(e))
             connectTask = None
             raise e
     except Exception as e:
-        print("- Unhandled exception: {0}".format(e))
+        log.warn("- Unhandled exception: {0}".format(e))
         connectTask = None
         raise e
 
 async def connect():
     address = load_config()['address']
-    print("Connecting to {0}".format(address))
+    log.info("Connecting to {0}".format(address))
     await ctler.run(address)
     await asyncio.sleep(minimal_cmd_space)
 
 
 async def disconnect():
     global connectTask
-    connectTask = None
+    if connectTask is not None:
+        await connectTask
+        connectTask = None
 
     await ctler.disconnect()
     await asyncio.sleep(minimal_cmd_space)
@@ -170,7 +225,6 @@ async def get_pad_mode(request):
 @routes.post("/mode")
 async def change_pad_mode(request):
     new_mode = request.rel_url.query.get('new_mode', 'manual')
-    print("Got mode {0}".format(new_mode))
 
     if (new_mode.lower() == "standby"):
         pad_mode = WalkingPad.MODE_STANDBY
@@ -195,7 +249,7 @@ async def change_pad_mode(request):
 @routes.post("/speed")
 async def change_speed(request):
     value = request.rel_url.query.get('value', '')
-    print("Setting speed to {0} km/h".format(value))
+    log.info("Setting speed to {0} km/h".format(value))
 
     try:
         await ctler.change_speed(int(float(value) * 10))
@@ -214,7 +268,7 @@ async def change_speed(request):
 async def change_pref(request):
     name = request.match_info.get('name', '')
     value = request.rel_url.query.get('value', '')
-    print("Setting preference {0} to {1}".format(name, value))
+    log.info("Setting preference {0} to {1}".format(name, value))
 
     try:
         await ensureConnected()
@@ -235,48 +289,28 @@ async def change_pref(request):
 
 @routes.get("/status")
 async def get_status(request):
-    try:
-        await ensureConnected()
+    global last_json_status_ts
+    global last_json_status
 
-        await ctler.ask_stats()
-        await asyncio.sleep(minimal_cmd_space)
-    except BleakError as e:
-        await ctler.disconnect()
-        raise web.HTTPServiceUnavailable(text=str(e))
+    if time.time() - last_json_status_ts < 5:
+        json_status = last_json_status
+    else:
+        try:
+            await ensureConnected()
 
-    stats = ctler.last_status
-    mode = stats.manual_mode
-    belt_state = stats.belt_state
+            await ctler.ask_stats()
+            last_json_status_ts = time.time()
+            await asyncio.sleep(minimal_cmd_space)
+        except BleakError as e:
+            await ctler.disconnect()
+            raise web.HTTPServiceUnavailable(text=str(e))
 
-    if (mode == WalkingPad.MODE_STANDBY):
-        mode = "standby"
-    elif (mode == WalkingPad.MODE_MANUAL):
-        mode = "manual"
-    elif (mode == WalkingPad.MODE_AUTOMAT):
-        mode = "auto"
+        json_status = get_status_json(ctler.last_status)
+        last_json_status = json_status
 
-    if (belt_state == 5):
-        belt_state = "standby"
-    elif (belt_state == 0):
-        belt_state = "idle"
-    elif (belt_state == 1):
-        belt_state = "running"
-    elif (belt_state >=7):
-        belt_state = "starting"
+        update_prom_status(json_status)
 
-    dist = stats.dist / 100
-    time = stats.time
-    steps = stats.steps
-    speed = stats.app_speed / 30
-
-    prom_steps.set(steps)
-    prom_distance.set(dist)
-    prom_speed.set(speed)
-    prom_state.state(belt_state)
-    prom_mode.state(mode)
-
-    return web.json_response({ "dist": dist, "time": time, "steps": steps, "speed": speed, "belt_state": belt_state, "mode": mode })
-
+    return web.json_response(json_status)
 
 @routes.get("/history")
 async def get_history(request):
@@ -338,6 +372,7 @@ async def app_factory():
     global ctler
 
     ctler.handler_last_status = on_new_status
+    ctler.handler_cur_status = on_new_current_status
 
     await ensureConnected()
 
