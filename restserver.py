@@ -88,7 +88,7 @@ def get_status_json(status):
     dist = status.dist / 100
     time = status.time
     steps = status.steps
-    speed = status.app_speed / 30
+    speed = status.speed / 10
 
     return { "dist": dist, "time": time, "steps": steps, "speed": speed, "belt_state": belt_state, "mode": mode }
 
