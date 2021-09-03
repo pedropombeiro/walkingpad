@@ -258,7 +258,11 @@ async def change_pad_mode(request):
 
 @routes.post("/speed")
 async def change_speed(request):
-    value = request.rel_url.query.get('value', '')
+    if request.body_exists:
+        json_body = await request.json()
+        value = json_body['speed']
+    else:
+        value = request.rel_url.query.get('value', '')
     log.info("Setting speed to {0} km/h".format(value))
 
     try:
@@ -393,5 +397,5 @@ async def app_factory():
 
 if __name__ == '__main__':
     start_http_server(8000) # Start Prometheus server
-    logging.basicConfig(level=logging.INFO)
+    #logging.basicConfig(level=logging.INFO)
     web.run_app(app_factory(), port=5678)
