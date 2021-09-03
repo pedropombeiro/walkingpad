@@ -5,6 +5,7 @@ from ph4_walkingpad.pad import WalkingPad, Controller
 from ph4_walkingpad.utils import setup_logging
 from prometheus_client import start_http_server, Gauge, Enum
 import asyncio
+import logging
 import time
 import yaml
 import psycopg2
@@ -228,7 +229,11 @@ async def get_pad_mode(request):
 
 @routes.post("/mode")
 async def change_pad_mode(request):
-    new_mode = request.rel_url.query.get('new_mode', 'manual')
+    if request.body_exists:
+        json_body = await request.json()
+        new_mode = json_body['mode']
+    else:
+        new_mode = request.rel_url.query.get('new_mode', '')
 
     if (new_mode.lower() == "standby"):
         pad_mode = WalkingPad.MODE_STANDBY
@@ -242,6 +247,7 @@ async def change_pad_mode(request):
     try:
         await ensureConnected()
 
+        log.info("Switching mode to {0}".format(new_mode))
         await ctler.switch_mode(pad_mode)
         await asyncio.sleep(minimal_cmd_space)
 
@@ -387,4 +393,5 @@ async def app_factory():
 
 if __name__ == '__main__':
     start_http_server(8000) # Start Prometheus server
+    logging.basicConfig(level=logging.INFO)
     web.run_app(app_factory(), port=5678)
