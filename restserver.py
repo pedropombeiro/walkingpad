@@ -174,7 +174,11 @@ async def connect():
 async def disconnect():
     global connectTask
     if connectTask is not None:
-        await connectTask
+        try:
+            await connectTask
+        except RuntimeError:
+            # ignore already awaited task
+            pass
         connectTask = None
 
     await ctler.disconnect()
