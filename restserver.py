@@ -3,7 +3,7 @@ from bleak.exc import BleakError
 from ph4_walkingpad import pad
 from ph4_walkingpad.pad import WalkingPad, Controller
 from ph4_walkingpad.utils import setup_logging
-from prometheus_client import start_http_server, Gauge, Enum
+from prometheus_client import start_http_server, Counter, Gauge, Enum
 import asyncio
 import logging
 import time
@@ -31,10 +31,12 @@ last_status = {
     "time": None
 }
 
-prom_steps = Gauge('walkingpad_steps', 'WalkingPad session step count')
-prom_distance = Gauge('walkingpad_dist', 'WalkingPad distance')
+prom_session_steps = Gauge('walkingpad_steps_session', 'WalkingPad session step count')
+prom_steps_total = Counter('walkingpad_steps_total', 'WalkingPad total steps')
+prom_session_distance = Gauge('walkingpad_distance_session', 'WalkingPad distance')
+prom_distance_total = Counter('walkingpad_distance_total', 'WalkingPad total distance')
 prom_speed = Gauge('walkingpad_speed', 'WalkingPad speed')
-prom_state = Enum('walkingpad_state', 'WalkingPad state', states=['idle', 'standby', 'starting', 'running'])
+prom_state = Enum('walkingpad_state', 'WalkingPad state', states=['idle', 'standby', 'starting', 'running', 'stopping'])
 prom_mode = Enum('walkingpad_mode', 'WalkingPad mode', states=['manual', 'auto', 'standby'])
 
 def on_new_status(sender, record):
@@ -49,19 +51,19 @@ def on_new_status(sender, record):
     last_status['distance'] = distance_in_km
     last_status['time'] = record.time
 
-    json_status = get_status_json(record)
-    update_prom_status(json_status)
-
 def on_new_current_status(sender, record):
+    global last_json_status, last_json_status_ts
 
     json_status = get_status_json(record)
+    last_json_status_ts = time.time()
+    last_json_status = json_status
     print("{0} - Received Current Record: {1}".format(datetime.now(), json_status))
 
     update_prom_status(json_status)
 
 def update_prom_status(json_status):
-    prom_steps.set(json_status["steps"])
-    prom_distance.set(json_status["dist"])
+    prom_session_steps.set(json_status["steps"])
+    prom_session_distance.set(json_status["dist"])
     prom_speed.set(json_status["speed"])
     prom_state.state(json_status["belt_state"])
     prom_mode.state(json_status["mode"])
@@ -83,6 +85,8 @@ def get_status_json(status):
         belt_state = "idle"
     elif (belt_state == 1):
         belt_state = "running"
+    elif (belt_state == 3):
+        belt_state = "stopping"
     elif (belt_state >=7):
         belt_state = "starting"
 
@@ -206,6 +210,9 @@ async def _get_pad_mode():
     await ctler.ask_stats()
     await asyncio.sleep(minimal_cmd_space)
     stats = ctler.last_status
+    if stats is None:
+        return web.HTTPNotFound()
+
     mode = stats.manual_mode
 
     if (mode == WalkingPad.MODE_STANDBY):
@@ -313,18 +320,12 @@ async def get_status(request):
             await ensureConnected()
 
             await ctler.ask_stats()
-            last_json_status_ts = time.time()
             await asyncio.sleep(minimal_cmd_space)
         except BleakError as e:
             await ctler.disconnect()
             raise web.HTTPServiceUnavailable(text=str(e))
 
-        json_status = get_status_json(ctler.last_status)
-        last_json_status = json_status
-
-        update_prom_status(json_status)
-
-    return web.json_response(json_status)
+    return web.json_response(last_json_status)
 
 @routes.get("/history")
 async def get_history(request):
@@ -369,9 +370,15 @@ async def finish_walk(request):
 
         await ctler.stop_belt()
         await asyncio.sleep(minimal_cmd_space)
-        await ctler.switch_mode(WalkingPad.MODE_STANDBY)
+
+        await ctler.ask_stats()
         await asyncio.sleep(minimal_cmd_space)
+        prom_steps_total.inc(int(ctler.last_status.steps))
+        prom_distance_total.inc(float(ctler.last_status.dist) / 100.0)
+
         await ctler.ask_hist(0)
+        await asyncio.sleep(minimal_cmd_space)
+        await ctler.switch_mode(WalkingPad.MODE_STANDBY)
         await asyncio.sleep(minimal_cmd_space)
         store_in_db(last_status['steps'], last_status['distance'], last_status['time'])
 
