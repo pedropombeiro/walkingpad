@@ -232,6 +232,11 @@ async def _get_pad_mode():
 @routes.get("/mode")
 async def get_pad_mode(request):
     try:
+        if request.rel_url.query.get('new_mode', '') != '':
+            # Some clients, like the Stream Deck can only perform GET requests,
+            # so we forward those to the POST handler
+            return await change_pad_mode(request)
+
         await ensureConnected()
 
         return await _get_pad_mode()
@@ -260,6 +265,8 @@ async def change_pad_mode(request):
         await ensureConnected()
 
         log.info("Switching mode to {0}".format(new_mode))
+        await ctler.switch_mode(pad_mode)
+        await asyncio.sleep(minimal_cmd_space)
         await ctler.switch_mode(pad_mode)
         await asyncio.sleep(minimal_cmd_space)
 
