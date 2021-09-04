@@ -16,6 +16,8 @@ connectTask = None
 last_comm_ts = 0
 last_json_status_ts = 0
 last_json_status = {}
+session_start_steps = 0
+session_start_dist = 0
 
 # minimal_cmd_space does not exist in the version we use from pip, thus we define it here.
 # This should be removed once we can take it from the controller
@@ -164,6 +166,9 @@ async def ensureConnected(attempt=0):
             log.debug("Giving up retrying. Raising '{0}'".format(e))
             connectTask = None
             raise e
+    except RuntimeError:
+        # coroutine might be being awaited already, ignore
+        pass
     except Exception as e:
         log.warn("- Unhandled exception: {0}".format(e))
         connectTask = None
@@ -346,6 +351,8 @@ def save(request):
 
 @routes.post("/startwalk")
 async def start_walk(request):
+    global session_start_steps, session_start_dist
+
     try:
         await ensureConnected()
 
@@ -358,6 +365,9 @@ async def start_walk(request):
         await ctler.ask_hist(0)
         await asyncio.sleep(minimal_cmd_space)
 
+        session_start_steps = int(ctler.last_status.steps)
+        session_start_dist = float(ctler.last_status.dist) / 100.0
+
         return web.json_response(last_status)
     except BleakError as e:
         await ctler.disconnect()
@@ -368,17 +378,15 @@ async def finish_walk(request):
     try:
         await ensureConnected()
 
-        await ctler.stop_belt()
+        await ctler.switch_mode(WalkingPad.MODE_STANDBY)
         await asyncio.sleep(minimal_cmd_space)
 
         await ctler.ask_stats()
         await asyncio.sleep(minimal_cmd_space)
-        prom_steps_total.inc(int(ctler.last_status.steps))
-        prom_distance_total.inc(float(ctler.last_status.dist) / 100.0)
+        prom_steps_total.inc(int(ctler.last_status.steps) - session_start_steps)
+        prom_distance_total.inc((float(ctler.last_status.dist) / 100.0) - session_start_dist)
 
         await ctler.ask_hist(0)
-        await asyncio.sleep(minimal_cmd_space)
-        await ctler.switch_mode(WalkingPad.MODE_STANDBY)
         await asyncio.sleep(minimal_cmd_space)
         store_in_db(last_status['steps'], last_status['distance'], last_status['time'])
 
