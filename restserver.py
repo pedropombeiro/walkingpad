@@ -5,7 +5,6 @@ from ph4_walkingpad.pad import WalkingPad, Controller
 from ph4_walkingpad.utils import setup_logging
 from prometheus_client import start_http_server, Counter, Gauge, Enum
 import asyncio
-import logging
 import time
 import yaml
 import psycopg2
@@ -13,7 +12,9 @@ from datetime import date, datetime
 
 routes = web.RouteTableDef()
 connectTask = None
-last_comm_ts = 0
+current_request_ts = None
+last_comm_rx_ts = 0
+last_comm_tx_ts = 0
 last_json_status_ts = 0
 last_json_status = {}
 session_start_steps = 0
@@ -42,6 +43,9 @@ prom_state = Enum('walkingpad_state', 'WalkingPad state', states=['idle', 'stand
 prom_mode = Enum('walkingpad_mode', 'WalkingPad mode', states=['manual', 'auto', 'standby'])
 
 def on_new_status(sender, record):
+    global last_comm_rx_ts
+
+    last_comm_rx_ts = time.time()
 
     distance_in_km = record.dist / 100
     print("Received Record:")
@@ -54,14 +58,22 @@ def on_new_status(sender, record):
     last_status['time'] = record.time
 
 def on_new_current_status(sender, record):
-    global last_json_status, last_json_status_ts
+    global last_json_status, last_json_status_ts, last_comm_rx_ts
 
-    json_status = get_status_json(record)
+    last_comm_rx_ts = time.time()
+    json_status = create_json_status(record)
     last_json_status_ts = time.time()
     last_json_status = json_status
     print("{0} - Received Current Record: {1}".format(datetime.now(), json_status))
 
     update_prom_status(json_status)
+
+def on_web_request():
+    global current_request_ts
+    if current_request_ts is not None:
+        raise web.HTTPTooManyRequests(text=str("Request in progress, please try again"))
+
+    current_request_ts = time.time()
 
 def update_prom_status(json_status):
     prom_session_steps.set(json_status["steps"])
@@ -70,7 +82,7 @@ def update_prom_status(json_status):
     prom_state.state(json_status["belt_state"])
     prom_mode.state(json_status["mode"])
 
-def get_status_json(status):
+def create_json_status(status):
     mode = status.manual_mode
     belt_state = status.belt_state
 
@@ -135,43 +147,49 @@ def save_config(config):
         yaml.dump(config, outfile, default_flow_style=False)
 
 
-async def done():
-    # No- op
-    return
-
 async def ensureConnected(attempt=0):
-    global connectTask
-    global last_comm_ts
+    global connectTask, ctler
+    global last_comm_rx_ts, last_comm_tx_ts
 
-    if last_comm_ts != 0 and (time.time() - last_comm_ts) > 60:
+    if last_comm_tx_ts != 0 and (last_comm_tx_ts - last_comm_rx_ts) > 30:
+        log.warning("Disconnecting after 30 seconds without connection")
         await disconnect()
+
+    last_comm_tx_ts = time.time()
 
     log.debug("- Attempt #{0}".format(attempt+1))
     if connectTask is None:
-        log.debug("- connectTask was None")
-        connectTask = connect()
+        if (last_comm_tx_ts - last_comm_rx_ts) > 30:
+            log.debug("- connectTask was None")
+            connectTask = connect()
+        else:
+            # connectTask is None, but we're still valid
+            return
 
     try:
         await connectTask
-        connectTask = done()
-        last_comm_ts = time.time()
-        log.debug("- Setting connectTask to done()")
+        connectTask = None
+        last_comm_rx_ts = time.time()
+        log.debug("- Setting connectTask to None")
     except BleakError as e:
+        log.error("- BleakError in ensureConnected: {0}".format(e))
+
         if attempt < 1:
             await ctler.disconnect()
 
-            connectTask = connect()
+            connectTask = None
             await ensureConnected(attempt+1)
         else:
             log.debug("Giving up retrying. Raising '{0}'".format(e))
             connectTask = None
+            last_comm_rx_ts = 0 # Force reconnection
             raise e
     except RuntimeError:
         # coroutine might be being awaited already, ignore
         pass
     except Exception as e:
-        log.warn("- Unhandled exception: {0}".format(e))
-        connectTask = None
+        log.warning("- Unhandled exception: {0}".format(e))
+        last_comm_rx_ts = 0 # Force reconnection
         raise e
 
 async def connect():
@@ -182,7 +200,9 @@ async def connect():
 
 
 async def disconnect():
-    global connectTask
+    log.debug("Disconnecting in restserver.py")
+
+    global connectTask, ctler
     if connectTask is not None:
         try:
             await connectTask
@@ -212,6 +232,11 @@ def set_config_address(request):
 
 
 async def _get_pad_mode():
+    if time.time() - last_json_status_ts < 5:
+        return web.json_response({ "mode": last_json_status["mode"] })
+
+    await ensureConnected()
+
     await ctler.ask_stats()
     await asyncio.sleep(minimal_cmd_space)
     stats = ctler.last_status
@@ -231,37 +256,47 @@ async def _get_pad_mode():
 
 @routes.get("/mode")
 async def get_pad_mode(request):
+    global current_request_ts
+
+    if request.rel_url.query.get('new_mode', '') != '':
+        # Some clients, like the Stream Deck can only perform GET requests,
+        # so we forward those to the POST handler
+        return await change_pad_mode(request)
+
+    on_web_request()
+
     try:
-        if request.rel_url.query.get('new_mode', '') != '':
-            # Some clients, like the Stream Deck can only perform GET requests,
-            # so we forward those to the POST handler
-            return await change_pad_mode(request)
-
-        await ensureConnected()
-
         return await _get_pad_mode()
     except BleakError as e:
-        await ctler.disconnect()
+        log.error("BleakError in get_pad_mode: {0}".format(e))
+        await disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
 
 @routes.post("/mode")
 async def change_pad_mode(request):
-    if request.body_exists:
-        json_body = await request.json()
-        new_mode = json_body['mode']
-    else:
-        new_mode = request.rel_url.query.get('new_mode', '')
-
-    if (new_mode.lower() == "standby"):
-        pad_mode = WalkingPad.MODE_STANDBY
-    elif (new_mode.lower() == "manual"):
-        pad_mode = WalkingPad.MODE_MANUAL
-    elif (new_mode.lower() == "auto"):
-        pad_mode = WalkingPad.MODE_AUTOMAT
-    else:
-        return web.HTTPBadRequest(text="Mode {0} not supported".format(new_mode))
+    global current_request_ts
+    on_web_request()
 
     try:
+        if request.body_exists:
+            json_body = await request.json()
+            new_mode = json_body['mode']
+        else:
+            new_mode = request.rel_url.query.get('new_mode', '')
+
+        if (new_mode.lower() == "standby"):
+            pad_mode = WalkingPad.MODE_STANDBY
+        elif (new_mode.lower() == "manual"):
+            pad_mode = WalkingPad.MODE_MANUAL
+        elif (new_mode.lower() == "auto"):
+            pad_mode = WalkingPad.MODE_AUTOMAT
+        else:
+            return web.HTTPBadRequest(text="Mode {0} not supported".format(new_mode))
+
         await ensureConnected()
 
         log.info("Switching mode to {0}".format(new_mode))
@@ -272,19 +307,28 @@ async def change_pad_mode(request):
 
         return await _get_pad_mode()
     except BleakError as e:
-        await ctler.disconnect()
+        log.error("BleakError in get_pad_mode: {0}".format(e))
+        await disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
+
 
 @routes.post("/speed")
 async def change_speed(request):
-    if request.body_exists:
-        json_body = await request.json()
-        value = json_body['speed']
-    else:
-        value = request.rel_url.query.get('value', '')
-    log.info("Setting speed to {0} km/h".format(value))
+    global current_request_ts
+    on_web_request()
 
     try:
+        if request.body_exists:
+            json_body = await request.json()
+            value = json_body['speed']
+        else:
+            value = request.rel_url.query.get('value', '')
+        log.info("Setting speed to {0} km/h".format(value))
+
         await ctler.change_speed(int(float(value) * 10))
 
         await asyncio.sleep(minimal_cmd_space)
@@ -294,11 +338,20 @@ async def change_speed(request):
 
         return web.json_response({ "speed": stats.app_speed / 30 })
     except BleakError as e:
-        await ctler.disconnect()
+        log.error("BleakError in change_speed: {0}".format(e))
+        await disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
+
 
 @routes.post("/pref/{name}")
 async def change_pref(request):
+    global current_request_ts
+    on_web_request()
+
     name = request.match_info.get('name', '')
     value = request.rel_url.query.get('value', '')
     log.info("Setting preference {0} to {1}".format(name, value))
@@ -315,32 +368,48 @@ async def change_pref(request):
         else:
             return web.HTTPBadRequest(text="Preference {0} not supported".format(name))
     except BleakError as e:
-        await ctler.disconnect()
+        log.error("BleakError in change_pref: {0}".format(e))
+        await disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
 
     await asyncio.sleep(minimal_cmd_space)
 
 @routes.get("/status")
 async def get_status(request):
-    global last_json_status_ts
-    global last_json_status
+    global last_json_status, last_json_status_ts
+    global current_request_ts
 
     if time.time() - last_json_status_ts < 5:
         json_status = last_json_status
     else:
+        on_web_request()
+
         try:
             await ensureConnected()
 
             await ctler.ask_stats()
             await asyncio.sleep(minimal_cmd_space)
+            json_status = last_json_status
         except BleakError as e:
-            await ctler.disconnect()
+            log.error("BleakError in get_status: {0}".format(e))
+            await disconnect()
             raise web.HTTPServiceUnavailable(text=str(e))
+        except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+            raise web.HTTPGone(text=str(e))
+        finally:
+            current_request_ts = None
 
-    return web.json_response(last_json_status)
+    return web.json_response(json_status)
 
 @routes.get("/history")
 async def get_history(request):
+    global current_request_ts
+    on_web_request()
+
     try:
         await ensureConnected()
 
@@ -349,8 +418,13 @@ async def get_history(request):
 
         return web.json_response(last_status)
     except BleakError as e:
-        await ctler.disconnect()
+        log.error("BleakError in get_history: {0}".format(e))
+        await disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
 
 @routes.post("/save")
 def save(request):
@@ -359,6 +433,9 @@ def save(request):
 @routes.post("/startwalk")
 async def start_walk(request):
     global session_start_steps, session_start_dist
+    global current_request_ts
+
+    on_web_request()
 
     try:
         await ensureConnected()
@@ -377,11 +454,22 @@ async def start_walk(request):
 
         return web.json_response(last_status)
     except BleakError as e:
-        await ctler.disconnect()
+        log.error("BleakError in start_walk: {0}".format(e))
+        await disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
 
 @routes.post("/finishwalk")
 async def finish_walk(request):
+    global current_request_ts
+    while current_request_ts is not None:
+        await asyncio.sleep(1)
+
+    current_request_ts = time.time()
+
     try:
         await ensureConnected()
 
@@ -399,18 +487,23 @@ async def finish_walk(request):
 
         return web.json_response(last_status)
     except BleakError as e:
-        await ctler.disconnect()
+        log.error("BleakError in finish_walk: {0}".format(e))
+        await disconnect()
         raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
 
 
 async def app_factory():
-    global connectTask
-    global ctler
-
     ctler.handler_last_status = on_new_status
     ctler.handler_cur_status = on_new_current_status
 
-    await ensureConnected()
+    try:
+        await ensureConnected()
+    except:
+        pass
 
     app = web.Application()
     app.add_routes(routes)
@@ -420,4 +513,4 @@ async def app_factory():
 if __name__ == '__main__':
     start_http_server(8000) # Start Prometheus server
     #logging.basicConfig(level=logging.INFO)
-    web.run_app(app_factory(), port=5678)
+    web.run_app(app_factory(), port=5678, shutdown_timeout=15)
