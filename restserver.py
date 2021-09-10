@@ -18,7 +18,10 @@ last_comm_tx_ts = 0
 last_json_status_ts = 0
 last_json_status = {}
 session_start_steps = 0
+session_current_steps = 0
 session_start_dist = 0
+session_current_dist = 0
+is_walking = False
 
 # minimal_cmd_space does not exist in the version we use from pip, thus we define it here.
 # This should be removed once we can take it from the controller
@@ -59,21 +62,29 @@ def on_new_status(sender, record):
 
 def on_new_current_status(sender, record):
     global last_json_status, last_json_status_ts, last_comm_rx_ts
+    global session_current_steps, session_current_dist
 
     last_comm_rx_ts = time.time()
     json_status = create_json_status(record)
     last_json_status_ts = time.time()
     last_json_status = json_status
+    if is_walking and (json_status['belt_state'] == 'running' or json_status['belt_state'] == 'starting'):
+        session_current_steps = int(record.steps)
+        session_current_dist = float(record.dist) / 100.0
     print("{0} - Received Current Record: {1}".format(datetime.now(), json_status))
 
     update_prom_status(json_status)
 
-def on_web_request():
+async def on_web_request():
     global current_request_ts
     if current_request_ts is not None:
         raise web.HTTPTooManyRequests(text=str("Request in progress, please try again"))
 
     current_request_ts = time.time()
+
+    if is_walking and (last_json_status['belt_state'] != 'running' and last_json_status['belt_state'] != 'starting'):
+        log.warning("Automatically finishing walk since belt state is now {0}".format(last_json_status['belt_state']))
+        await finish_walk(None)
 
 def update_prom_status(json_status):
     prom_session_steps.set(json_status["steps"])
@@ -263,7 +274,7 @@ async def get_pad_mode(request):
         # so we forward those to the POST handler
         return await change_pad_mode(request)
 
-    on_web_request()
+    await on_web_request()
 
     try:
         return await _get_pad_mode()
@@ -279,7 +290,7 @@ async def get_pad_mode(request):
 @routes.post("/mode")
 async def change_pad_mode(request):
     global current_request_ts
-    on_web_request()
+    await on_web_request()
 
     try:
         if request.body_exists:
@@ -319,7 +330,7 @@ async def change_pad_mode(request):
 @routes.post("/speed")
 async def change_speed(request):
     global current_request_ts
-    on_web_request()
+    await on_web_request()
 
     try:
         if request.body_exists:
@@ -350,7 +361,7 @@ async def change_speed(request):
 @routes.post("/pref/{name}")
 async def change_pref(request):
     global current_request_ts
-    on_web_request()
+    await on_web_request()
 
     name = request.match_info.get('name', '')
     value = request.rel_url.query.get('value', '')
@@ -386,7 +397,7 @@ async def get_status(request):
     if time.time() - last_json_status_ts < 5:
         json_status = last_json_status
     else:
-        on_web_request()
+        await on_web_request()
 
         try:
             await ensureConnected()
@@ -408,7 +419,7 @@ async def get_status(request):
 @routes.get("/history")
 async def get_history(request):
     global current_request_ts
-    on_web_request()
+    await on_web_request()
 
     try:
         await ensureConnected()
@@ -433,9 +444,9 @@ def save(request):
 @routes.post("/startwalk")
 async def start_walk(request):
     global session_start_steps, session_start_dist
-    global current_request_ts
+    global current_request_ts, is_walking
 
-    on_web_request()
+    await on_web_request()
 
     try:
         await ensureConnected()
@@ -451,6 +462,8 @@ async def start_walk(request):
 
         session_start_steps = int(ctler.last_status.steps)
         session_start_dist = float(ctler.last_status.dist) / 100.0
+        is_walking = True
+        log.debug("Walking flag is now {0}".format(is_walking))
 
         return web.json_response(last_status)
     except BleakError as e:
@@ -464,8 +477,8 @@ async def start_walk(request):
 
 @routes.post("/finishwalk")
 async def finish_walk(request):
-    global current_request_ts
-    while current_request_ts is not None:
+    global current_request_ts, is_walking
+    while request is not None and current_request_ts is not None:
         await asyncio.sleep(1)
 
     current_request_ts = time.time()
@@ -476,10 +489,13 @@ async def finish_walk(request):
         await ctler.switch_mode(WalkingPad.MODE_STANDBY)
         await asyncio.sleep(minimal_cmd_space)
 
+        is_walking = False
+        log.debug("Walking flag is now {0}".format(is_walking))
+
         await ctler.ask_stats()
         await asyncio.sleep(minimal_cmd_space)
-        prom_steps_total.inc(int(ctler.last_status.steps) - session_start_steps)
-        prom_distance_total.inc((float(ctler.last_status.dist) / 100.0) - session_start_dist)
+        prom_steps_total.inc(session_current_steps - session_start_steps)
+        prom_distance_total.inc(session_current_dist - session_start_dist)
 
         await ctler.ask_hist(0)
         await asyncio.sleep(minimal_cmd_space)
