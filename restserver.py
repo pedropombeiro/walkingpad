@@ -327,6 +327,31 @@ async def change_pad_mode(request):
         current_request_ts = None
 
 
+@routes.get("/speed")
+async def get_speed(request):
+    if request.rel_url.query.get('new_speed', '') != '':
+        # Some clients, like the Stream Deck can only perform GET requests,
+        # so we forward those to the POST handler
+        return await change_speed(request)
+
+    global current_request_ts
+    await on_web_request()
+
+    try:
+        await ctler.ask_stats()
+        await asyncio.sleep(minimal_cmd_space)
+        stats = ctler.last_status
+
+        return web.json_response({ "speed": stats.app_speed / 30 })
+    except BleakError as e:
+        log.error("BleakError in change_speed: {0}".format(e))
+        await disconnect()
+        raise web.HTTPServiceUnavailable(text=str(e))
+    except AttributeError as e: # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
+        raise web.HTTPGone(text=str(e))
+    finally:
+        current_request_ts = None
+
 @routes.post("/speed")
 async def change_speed(request):
     global current_request_ts
@@ -337,7 +362,7 @@ async def change_speed(request):
             json_body = await request.json()
             value = json_body['speed']
         else:
-            value = request.rel_url.query.get('value', '')
+            value = float(request.rel_url.query.get('new_speed', ''))
         log.info("Setting speed to {0} km/h".format(value))
 
         await ctler.change_speed(int(float(value) * 10))
