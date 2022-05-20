@@ -7,9 +7,12 @@ from prometheus_client import start_http_server, Counter, Gauge, Enum
 import asyncio
 import time
 import yaml
-import psycopg2
+import requests
+import stravalib
 from datetime import date, datetime
 
+
+stravaClient = None
 routes = web.RouteTableDef()
 connectTask = None
 current_request_ts = None
@@ -31,6 +34,7 @@ log = setup_logging()
 pad.logger = log
 ctler = Controller()
 
+session_start_time = None
 last_status = {
     "steps": None,
     "distance": None,
@@ -44,6 +48,9 @@ prom_distance_total = Counter('walkingpad_distance_total', 'WalkingPad total dis
 prom_speed = Gauge('walkingpad_speed', 'WalkingPad speed')
 prom_state = Enum('walkingpad_state', 'WalkingPad state', states=['idle', 'standby', 'starting', 'running', 'stopping'])
 prom_mode = Enum('walkingpad_mode', 'WalkingPad mode', states=['manual', 'auto', 'standby'])
+
+MY_STRAVA_CLIENT_ID=84887
+MY_STRAVA_CLIENT_SECRET='1333e847cae635edca26e7f8bfc8ba01b09a9035'
 
 def on_new_status(sender, record):
     global last_comm_rx_ts
@@ -124,25 +131,39 @@ def create_json_status(status):
 
 
 def store_in_db(steps, distance_in_km, duration_in_seconds):
-    db_config = load_config()['database']
-    if not db_config['host']:
-        return
+    config = load_config()
+    refresh_strava_token(stravaClient, config)
+    if stravaClient.access_token:
+        try:
+            stravaClient.create_activity(
+                'Walking Pad',
+                'Walk',
+                session_start_time,
+                int(duration_in_seconds),
+                description="{0} steps".format(steps),
+                distance=distance_in_km*1000
+            )
+        except requests.exceptions.JSONDecodeError:
+            pass
+    # db_config = load_config()['database']
+    # if not db_config['host']:
+        # return
 
-    try:
-        conn = psycopg2.connect(host=db_config['host'], port=db_config['port'],
-                                dbname=db_config['dbname'], user=db_config['user'], password=db_config['password'])
-        cur = conn.cursor()
+    # try:
+        # conn = psycopg2.connect(host=db_config['host'], port=db_config['port'],
+                                # dbname=db_config['dbname'], user=db_config['user'], password=db_config['password'])
+        # cur = conn.cursor()
 
-        date_today = date.today().strftime("%Y-%m-%d")
-        duration = int(duration_in_seconds / 60)
+        # date_today = date.today().strftime("%Y-%m-%d")
+        # duration = int(duration_in_seconds / 60)
 
-        cur.execute("INSERT INTO exercise VALUES ('{0}', {1}, {2}, {3})".format(
-            date_today, steps, duration, distance_in_km))
-        conn.commit()
+        # cur.execute("INSERT INTO exercise VALUES ('{0}', {1}, {2}, {3})".format(
+            # date_today, steps, duration, distance_in_km))
+        # conn.commit()
 
-    finally:
-        cur.close()
-        conn.close()
+    # finally:
+        # cur.close()
+        # conn.close()
 
 
 def load_config():
@@ -470,6 +491,7 @@ def save(request):
 async def start_walk(request):
     global session_start_steps, session_start_dist
     global current_request_ts, is_walking
+    global session_start_time
 
     await on_web_request()
 
@@ -489,6 +511,7 @@ async def start_walk(request):
         session_start_dist = float(ctler.last_status.dist) / 100.0
         is_walking = True
         log.debug("Walking flag is now {0}".format(is_walking))
+        session_start_time = datetime.now()
 
         return web.json_response(last_status)
     except BleakError as e:
@@ -503,6 +526,8 @@ async def start_walk(request):
 @routes.post("/finishwalk")
 async def finish_walk(request):
     global current_request_ts, is_walking
+    global session_start_time, stravaClient
+
     while request is not None and current_request_ts is not None:
         await asyncio.sleep(1)
 
@@ -522,9 +547,10 @@ async def finish_walk(request):
         prom_steps_total.inc(session_current_steps - session_start_steps)
         prom_distance_total.inc(session_current_dist - session_start_dist)
 
-        await ctler.ask_hist(0)
-        await asyncio.sleep(minimal_cmd_space)
-        store_in_db(last_status['steps'], last_status['distance'], last_status['time'])
+        # await ctler.ask_hist(0)
+        # await asyncio.sleep(minimal_cmd_space)
+        store_in_db(session_current_steps - session_start_steps, session_current_dist - session_start_dist,
+                (datetime.now() - session_start_time).total_seconds())
 
         return web.json_response(last_status)
     except BleakError as e:
@@ -536,6 +562,50 @@ async def finish_walk(request):
     finally:
         current_request_ts = None
 
+@routes.get("/authstrava")
+def auth_strava(request):
+    client = stravalib.Client()
+    stravaUrl = client.authorization_url(client_id=MY_STRAVA_CLIENT_ID,
+                                         redirect_uri='http://127.0.0.1:5678/authorization',
+                                         scope=['activity:write'])
+    return web.Response(text="<a href='{0}'>Authorize with Strava</a>".format(stravaUrl), content_type='text/html')
+
+@routes.get("/authorization")
+def strava_authorization(request):
+    global stravaClient
+
+    code = request.rel_url.query.get('code', '')
+
+    auth_response = stravaClient.exchange_code_for_token(client_id=MY_STRAVA_CLIENT_ID,
+                                                         client_secret=MY_STRAVA_CLIENT_SECRET,
+                                                         code=code)
+
+    save_strava_config(config, auth_response)
+
+    return web.Response(text="<h1>Successfully authenticated with Strava!</h1>", content_type='text/html')
+
+def save_strava_config(config, auth_response):
+    if 'activity_trackers' not in config:
+        config['activity_trackers'] = {}
+    config['activity_trackers'] = {'strava': auth_response}
+    save_config(config)
+
+def refresh_strava_token(client, config):
+    stravaConfig = config.get('activity_trackers', {}).get('strava', {})
+    expires_at = stravaConfig.get('expires_at', '')
+    refresh_token = stravaConfig.get('refresh_token', '')
+    if refresh_token == '':
+        log.warn("Please authenticate with Strava at /authstrava")
+        return
+
+    if client.access_token is None or datetime.now() > datetime.fromtimestamp(expires_at):
+        log.info("Refreshing Strava client token...")
+        try:
+            refresh_response = client.refresh_access_token(MY_STRAVA_CLIENT_ID, MY_STRAVA_CLIENT_SECRET, refresh_token)
+            save_strava_config(config, refresh_response)
+        except Exception as e:
+            log.info("Error refreshing client token: {0}", e)
+            pass
 
 async def app_factory():
     ctler.handler_last_status = on_new_status
@@ -552,6 +622,10 @@ async def app_factory():
     return app
 
 if __name__ == '__main__':
+    config = load_config()
+    access_token = config.get('activity_trackers', {}).get('strava', {}).get('access_token', '')
+    stravaClient = stravalib.Client(access_token=access_token)
+
     start_http_server(8000) # Start Prometheus server
     #logging.basicConfig(level=logging.INFO)
     web.run_app(app_factory(), port=5678, shutdown_timeout=15)
