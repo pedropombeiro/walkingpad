@@ -1,4 +1,4 @@
-aiohttp
+aiohttp_cors
 asyncio
 ph4_walkingpad
 prometheus_client

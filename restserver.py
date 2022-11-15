@@ -1,4 +1,5 @@
 from aiohttp import web
+import aiohttp_cors
 from bleak.exc import BleakError
 from ph4_walkingpad import pad
 from ph4_walkingpad.pad import WalkingPad, Controller
@@ -618,6 +619,18 @@ async def app_factory():
 
     app = web.Application()
     app.add_routes(routes)
+    cors = aiohttp_cors.setup(app, defaults={
+        # Allow all to read all CORS-enabled resources
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+        ),
+    })
+
+    # Configure CORS on all routes.
+    for route in list(app.router.routes()):
+        cors.add(route)
 
     return app
 
