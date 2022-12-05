@@ -132,6 +132,8 @@ def create_json_status(status):
 
 
 def store_in_db(steps, distance_in_km, duration_in_seconds):
+    global session_start_time
+
     config = load_config()
     refresh_strava_token(stravaClient, config)
     if stravaClient.access_token:
