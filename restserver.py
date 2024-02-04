@@ -317,14 +317,14 @@ async def _get_pad_mode():
 
 @routes.get("/mode")
 async def get_pad_mode(request):
-    global current_request_ts
-
     if request.rel_url.query.get("new_mode", "") != "":
         # Some clients, like the Stream Deck can only perform GET requests,
         # so we forward those to the POST handler
         return await change_pad_mode(request)
 
     await on_web_request()
+
+    global current_request_ts
 
     try:
         return await _get_pad_mode()
@@ -342,9 +342,9 @@ async def get_pad_mode(request):
 
 @routes.post("/mode")
 async def change_pad_mode(request):
-    global current_request_ts
     await on_web_request()
 
+    global current_request_ts
     try:
         if request.body_exists:
             json_body = await request.json()
@@ -389,9 +389,9 @@ async def get_speed(request):
         # so we forward those to the POST handler
         return await change_speed(request)
 
-    global current_request_ts
     await on_web_request()
 
+    global current_request_ts
     try:
         await ctler.ask_stats()
         await asyncio.sleep(minimal_cmd_space)
@@ -412,9 +412,9 @@ async def get_speed(request):
 
 @routes.post("/speed")
 async def change_speed(request):
-    global current_request_ts
     await on_web_request()
 
+    global current_request_ts
     try:
         if request.body_exists:
             json_body = await request.json()
@@ -445,13 +445,13 @@ async def change_speed(request):
 
 @routes.post("/pref/{name}")
 async def change_pref(request):
-    global current_request_ts
     await on_web_request()
 
     name = request.match_info.get("name", "")
     value = request.rel_url.query.get("value", "")
     log.info("Setting preference {0} to {1}".format(name, value))
 
+    global current_request_ts
     try:
         await ensureConnected()
 
@@ -480,13 +480,13 @@ async def change_pref(request):
 @routes.get("/status")
 async def get_status(request):
     global last_json_status, last_json_status_ts
-    global current_request_ts
 
     if time.time() - last_json_status_ts < 10:
         json_status = last_json_status
     else:
         await on_web_request()
 
+        global current_request_ts
         try:
             await ensureConnected()
 
@@ -509,9 +509,9 @@ async def get_status(request):
 
 @routes.get("/history")
 async def get_history(request):
-    global current_request_ts
     await on_web_request()
 
+    global current_request_ts
     try:
         await ensureConnected()
 
@@ -538,14 +538,14 @@ def save(request):
 
 @routes.post("/startwalk")
 async def start_walk(request):
-    global session_start_steps, session_start_dist
-    global current_request_ts, is_walking
-    global session_start_time
-
     await on_web_request()
 
     try:
         await ensureConnected()
+
+        global session_start_steps, session_start_dist
+        global is_walking
+        global session_start_time
 
         await ctler.switch_mode(
             WalkingPad.MODE_STANDBY
@@ -574,6 +574,7 @@ async def start_walk(request):
     ) as e:  # AttributeError can leak from ph4_walkingpad if the device is not available on reconnection
         raise web.HTTPGone(text=str(e))
     finally:
+        global current_request_ts
         current_request_ts = None
 
 
