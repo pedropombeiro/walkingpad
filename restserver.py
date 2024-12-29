@@ -159,19 +159,19 @@ def store_in_db(steps, distance_in_km, duration_in_seconds):
     global session_start_time
 
     config = load_config()
-    refresh_strava_token(stravaClient, config)
-    if stravaClient.access_token:
-        try:
-            stravaClient.create_activity(
-                "Walking Pad",
-                "Walk",
-                session_start_time,
-                int(duration_in_seconds),
-                description="{0} steps".format(steps),
-                distance=distance_in_km * 1000,
-            )
-        except requests.exceptions.JSONDecodeError:
-            pass
+    # refresh_strava_token(stravaClient, config)
+    # if stravaClient.access_token:
+    #     try:
+    #         stravaClient.create_activity(
+    #             "Walking Pad",
+    #             "Walk",
+    #             session_start_time,
+    #             int(duration_in_seconds),
+    #             description="{0} steps".format(steps),
+    #             distance=distance_in_km * 1000,
+    #         )
+    #     except requests.exceptions.JSONDecodeError:
+    #         pass
     # db_config = load_config()['database']
     # if not db_config['host']:
     # return
@@ -273,6 +273,7 @@ async def disconnect():
 
     await ctler.disconnect()
     await asyncio.sleep(minimal_cmd_space)
+    ctler = Controller()
 
 
 @routes.get("/config/address")
